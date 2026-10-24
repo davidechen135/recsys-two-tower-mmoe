@@ -1,0 +1,282 @@
+"""End-to-end training and evaluation pipeline for RecSys Two-Tower Recall & MMoE Ranking."""
+from __future__ import annotations
+
+import json
+from pathlib import Path
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import torch
+from torch.utils.data import DataLoader, TensorDataset
+
+try:
+    import lightgbm as lgb
+    _HAS_LGBM = True
+except Exception:
+    _HAS_LGBM = False
+
+from ..data.generator import generate_synthetic_user_behavior
+from ..features.extractor import extract_features
+from ..metrics import calculate_auc, calculate_gauc, calculate_ranking_metrics
+from ..models.deepfm import SingleTaskDeepFM
+from ..models.dssm import TwoTowerDSSM
+from ..models.mmoe_din import MMoEDINRanking
+from ..recall.faiss_index import (
+    FaissDSSMRecall,
+    GlobalPopularityRecall,
+    ItemCFRecall,
+    evaluate_recall_metrics,
+)
+
+
+def train_two_tower_dssm(
+    bundle,
+    embed_dim: int = 64,
+    out_dim: int = 64,
+    epochs: int = 4,
+    batch_size: int = 256,
+    lr: float = 0.002,
+    device: str = "cpu",
+) -> Tuple[TwoTowerDSSM, dict]:
+    print("  [Two-Tower] Training DSSM on positive interactions...")
+    train_df = bundle.train_recall_df
+    n_users = bundle.n_users
+    n_items = bundle.n_items
+    n_cats = bundle.n_categories
+
+    # Item metadata tensors
+    item_meta = bundle.item_meta_df
+    item_cats = torch.tensor(item_meta["category_id"].values, dtype=torch.long)
+    dense_cols = ["pv_to_cart_rate", "pv_to_buy_rate", "log_pv", "log_buy"]
+    item_dense = torch.tensor(item_meta[dense_cols].values, dtype=torch.float32)
+
+    # Popularity logQ
+    item_counts = item_meta["total_interactions"].values + 1.0
+    item_probs = item_counts / item_counts.sum()
+    log_q_all = torch.tensor(np.log(item_probs), dtype=torch.float32)
+
+    # Prepare training dataset
+    u_ids = torch.tensor(train_df["user_id"].values, dtype=torch.long)
+    i_ids = torch.tensor(train_df["item_id"].values, dtype=torch.long)
+    h_items = torch.tensor(np.vstack(train_df["history_items"].values), dtype=torch.long)
+    h_lens = torch.tensor(train_df["history_len"].values, dtype=torch.long)
+
+    dataset = TensorDataset(u_ids, i_ids, h_items, h_lens)
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=True)
+
+    model = TwoTowerDSSM(n_users, n_items, n_cats, embed_dim=embed_dim, out_dim=out_dim)
+    model.to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+
+    model.train()
+    for ep in range(epochs):
+        total_loss = 0.0
+        for batch in loader:
+            b_u, b_i, b_hist, b_lens = [t.to(device) for t in batch]
+            b_cats = item_cats[b_i].to(device)
+            b_dense = item_dense[b_i].to(device)
+            b_log_q = log_q_all[b_i].to(device)
+
+            optimizer.zero_grad()
+            loss, _, _ = model(b_u, b_hist, b_lens, b_i, b_cats, b_dense, item_log_q=b_log_q)
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+
+    # Build recall evaluation set from test_recall_df
+    test_df = bundle.test_recall_df
+    # Ground truth: items interacted by user in test set
+    gt_dict = {}
+    for uid, grp in test_df.groupby("user_id"):
+        gt_dict[uid] = set(grp["item_id"].unique())
+
+    # 1. Global Popularity baseline
+    pop_model = GlobalPopularityRecall(item_counts)
+    pop_retrievals = {uid: pop_model.retrieve(100) for uid in gt_dict}
+    pop_metrics = evaluate_recall_metrics(pop_retrievals, gt_dict)
+
+    # 2. ItemCF baseline
+    item_cf = ItemCFRecall(train_df, n_items)
+    # Get user test history
+    user_test_hist = dict(zip(test_df["user_id"], test_df["history_items"]))
+    cf_retrievals = {uid: item_cf.retrieve(user_test_hist.get(uid, []), 100) for uid in gt_dict}
+    cf_metrics = evaluate_recall_metrics(cf_retrievals, gt_dict)
+
+    # 3. DSSM with FAISS
+    faiss_dssm = FaissDSSMRecall(model, item_meta, dim=out_dim)
+    # Compute test user embeddings
+    model.eval()
+    test_u_df = test_df.drop_duplicates("user_id")
+    test_uids = test_u_df["user_id"].values
+    t_u = torch.tensor(test_uids, dtype=torch.long)
+    t_h = torch.tensor(np.vstack(test_u_df["history_items"].values), dtype=torch.long)
+    t_l = torch.tensor(test_u_df["history_len"].values, dtype=torch.long)
+    with torch.no_grad():
+        test_u_vecs = model.user_tower(t_u, t_h, t_l).cpu().numpy()
+
+    dssm_indices, latency_ms = faiss_dssm.retrieve_batch(test_u_vecs, top_k=100)
+    dssm_retrievals = {uid: dssm_indices[idx] for idx, uid in enumerate(test_uids)}
+    dssm_metrics = evaluate_recall_metrics(dssm_retrievals, gt_dict)
+    dssm_metrics["query_latency_ms"] = float(latency_ms)
+
+    # Lift
+    lift_vs_pop = (dssm_metrics["Recall@100"] - pop_metrics["Recall@100"]) / max(1e-6, pop_metrics["Recall@100"])
+    lift_vs_cf = (dssm_metrics["Recall@100"] - cf_metrics["Recall@100"]) / max(1e-6, cf_metrics["Recall@100"])
+
+    return model, {
+        "Popularity": pop_metrics,
+        "ItemCF": cf_metrics,
+        "TwoTower_DSSM": dssm_metrics,
+        "relative_lift_vs_pop_pct": float(lift_vs_pop * 100),
+        "relative_lift_vs_cf_pct": float(lift_vs_cf * 100),
+    }
+
+
+def train_ranking_models(
+    bundle,
+    embed_dim: int = 32,
+    epochs: int = 3,
+    batch_size: int = 256,
+    lr: float = 0.003,
+    device: str = "cpu",
+) -> Tuple[dict, dict]:
+    print("  [Ranking] Training Baselines and MMoE + DIN Multi-Task Model...")
+    train_df = bundle.train_rank_df
+    test_df = bundle.test_rank_df
+    n_users = bundle.n_users
+    n_items = bundle.n_items
+    n_cats = bundle.n_categories
+
+    dense_cols = ["pv_to_cart_rate", "pv_to_buy_rate", "log_pv", "log_buy"]
+
+    # 1. Baseline: LightGBM
+    lgb_metrics = {}
+    if _HAS_LGBM:
+        feat_cols = ["user_id", "item_id", "category_id"] + dense_cols
+        X_tr = train_df[feat_cols]
+        X_te = test_df[feat_cols]
+
+        clf_ctr = lgb.LGBMClassifier(n_estimators=100, learning_rate=0.08, verbose=-1, n_jobs=2, random_state=42)
+        clf_ctr.fit(X_tr, train_df["ctr_label"])
+        pred_ctr_lgb = clf_ctr.predict_proba(X_te)[:, 1]
+
+        clf_cvr = lgb.LGBMClassifier(n_estimators=100, learning_rate=0.08, verbose=-1, n_jobs=2, random_state=42)
+        # Train CVR on clicks
+        click_mask_tr = train_df["ctr_label"] == 1
+        clf_cvr.fit(X_tr[click_mask_tr], train_df.loc[click_mask_tr, "cvr_label"])
+        pred_cvr_lgb = clf_cvr.predict_proba(X_te)[:, 1]
+
+        lgb_metrics = calculate_ranking_metrics(
+            test_df["ctr_label"].values, pred_ctr_lgb,
+            test_df["cvr_label"].values, pred_cvr_lgb,
+            user_ids=test_df["user_id"].values,
+        )
+
+    # 2. Baseline: Single-Task DeepFM
+    def train_deepfm(target_col: str, click_only: bool = False):
+        sub_df = train_df[train_df["ctr_label"] == 1] if click_only else train_df
+        u_t = torch.tensor(sub_df["user_id"].values, dtype=torch.long)
+        i_t = torch.tensor(sub_df["item_id"].values, dtype=torch.long)
+        c_t = torch.tensor(sub_df["category_id"].values, dtype=torch.long)
+        d_t = torch.tensor(sub_df[dense_cols].values, dtype=torch.float32)
+        y_t = torch.tensor(sub_df[target_col].values, dtype=torch.float32)
+
+        loader = DataLoader(TensorDataset(u_t, i_t, c_t, d_t, y_t), batch_size=batch_size, shuffle=True)
+        model = SingleTaskDeepFM(n_users, n_items, n_cats, dense_dim=4, embed_dim=embed_dim).to(device)
+        opt = torch.optim.Adam(model.parameters(), lr=lr)
+
+        model.train()
+        for _ in range(epochs):
+            for b_u, b_i, b_c, b_d, b_y in loader:
+                opt.zero_grad()
+                p = model(b_u, b_i, b_c, b_d)
+                loss = torch.nn.functional.binary_cross_entropy(p, b_y)
+                loss.backward()
+                opt.step()
+
+        # Inference on test set
+        model.eval()
+        with torch.no_grad():
+            te_u = torch.tensor(test_df["user_id"].values, dtype=torch.long).to(device)
+            te_i = torch.tensor(test_df["item_id"].values, dtype=torch.long).to(device)
+            te_c = torch.tensor(test_df["category_id"].values, dtype=torch.long).to(device)
+            te_d = torch.tensor(test_df[dense_cols].values, dtype=torch.float32).to(device)
+            preds = model(te_u, te_i, te_c, te_d).cpu().numpy()
+        return preds
+
+    pred_ctr_deepfm = train_deepfm("ctr_label", click_only=False)
+    pred_cvr_deepfm = train_deepfm("cvr_label", click_only=True)
+    deepfm_metrics = calculate_ranking_metrics(
+        test_df["ctr_label"].values, pred_ctr_deepfm,
+        test_df["cvr_label"].values, pred_cvr_deepfm,
+        user_ids=test_df["user_id"].values,
+    )
+
+    # 3. MMoE + DIN Multi-Task Model
+    u_tr = torch.tensor(train_df["user_id"].values, dtype=torch.long)
+    i_tr = torch.tensor(train_df["item_id"].values, dtype=torch.long)
+    c_tr = torch.tensor(train_df["category_id"].values, dtype=torch.long)
+    h_tr = torch.tensor(np.vstack(train_df["history_items"].values), dtype=torch.long)
+    d_tr = torch.tensor(train_df[dense_cols].values, dtype=torch.float32)
+    y_ctr_tr = torch.tensor(train_df["ctr_label"].values, dtype=torch.float32)
+    y_cvr_tr = torch.tensor(train_df["cvr_label"].values, dtype=torch.float32)
+
+    train_loader = DataLoader(
+        TensorDataset(u_tr, i_tr, c_tr, h_tr, d_tr, y_ctr_tr, y_cvr_tr),
+        batch_size=batch_size,
+        shuffle=True,
+    )
+
+    mmoe_model = MMoEDINRanking(
+        n_users, n_items, n_cats, dense_dim=4, embed_dim=embed_dim, n_experts=4
+    ).to(device)
+    mmoe_opt = torch.optim.Adam(mmoe_model.parameters(), lr=lr)
+
+    mmoe_model.train()
+    for ep in range(epochs):
+        for b_u, b_i, b_c, b_h, b_d, b_ctr, b_cvr in train_loader:
+            b_u, b_i, b_c, b_h, b_d = b_u.to(device), b_i.to(device), b_c.to(device), b_h.to(device), b_d.to(device)
+            b_ctr, b_cvr = b_ctr.to(device), b_cvr.to(device)
+
+            mmoe_opt.zero_grad()
+            p_ctr, p_cvr, _, _ = mmoe_model(b_u, b_i, b_c, b_h, b_d)
+
+            # Joint loss: CTR loss on all samples + CVR loss on clicked samples (ESMM style)
+            loss_ctr = torch.nn.functional.binary_cross_entropy(p_ctr, b_ctr)
+            # CTCVR joint loss: pCTCVR = pCTR * pCVR
+            p_ctcvr = p_ctr * p_cvr
+            loss_cvr = torch.nn.functional.binary_cross_entropy(p_ctcvr, b_cvr)
+
+            loss = loss_ctr + 1.2 * loss_cvr
+            loss.backward()
+            mmoe_opt.step()
+
+    # Inference on test set
+    mmoe_model.eval()
+    with torch.no_grad():
+        u_te = torch.tensor(test_df["user_id"].values, dtype=torch.long).to(device)
+        i_te = torch.tensor(test_df["item_id"].values, dtype=torch.long).to(device)
+        c_te = torch.tensor(test_df["category_id"].values, dtype=torch.long).to(device)
+        h_te = torch.tensor(np.vstack(test_df["history_items"].values), dtype=torch.long).to(device)
+        d_te = torch.tensor(test_df[dense_cols].values, dtype=torch.float32).to(device)
+
+        pred_ctr_mmoe, pred_cvr_mmoe, w_ctr_gate, w_cvr_gate = mmoe_model(u_te, i_te, c_te, h_te, d_te)
+        p_ctr_arr = pred_ctr_mmoe.cpu().numpy()
+        p_cvr_arr = pred_cvr_mmoe.cpu().numpy()
+        w_ctr_mean = w_ctr_gate.mean(dim=0).cpu().numpy().tolist()
+        w_cvr_mean = w_cvr_gate.mean(dim=0).cpu().numpy().tolist()
+
+    mmoe_metrics = calculate_ranking_metrics(
+        test_df["ctr_label"].values, p_ctr_arr,
+        test_df["cvr_label"].values, p_cvr_arr,
+        user_ids=test_df["user_id"].values,
+    )
+    mmoe_metrics["gate_weights_ctr_mean"] = w_ctr_mean
+    mmoe_metrics["gate_weights_cvr_mean"] = w_cvr_mean
+
+    all_ranking = {
+        "LightGBM": lgb_metrics,
+        "DeepFM": deepfm_metrics,
+        "MMoE_DIN": mmoe_metrics,
+    }
+    return mmoe_model, all_ranking

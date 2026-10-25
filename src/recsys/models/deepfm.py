@@ -22,13 +22,13 @@ class SingleTaskDeepFM(nn.Module):
         # 1st order linear weights
         self.u_w = nn.Embedding(n_users, 1)
         self.i_w = nn.Embedding(n_items + 1, 1, padding_idx=0)
-        self.c_w = nn.Embedding(n_cats, 1)
+        self.c_w = nn.Embedding(n_cats + 1, 1, padding_idx=0)
         self.dense_w = nn.Linear(dense_dim, 1, bias=False)
 
         # 2nd order factorization embeddings
         self.u_e = nn.Embedding(n_users, embed_dim)
         self.i_e = nn.Embedding(n_items + 1, embed_dim, padding_idx=0)
-        self.c_e = nn.Embedding(n_cats, embed_dim)
+        self.c_e = nn.Embedding(n_cats + 1, embed_dim, padding_idx=0)
         self.dense_e = nn.Linear(dense_dim, embed_dim, bias=False)
 
         # Deep component MLP

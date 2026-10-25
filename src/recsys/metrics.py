@@ -45,7 +45,8 @@ def calculate_ranking_metrics(
     y_pred_ctr: np.ndarray,
     y_true_cvr: np.ndarray,
     y_pred_cvr: np.ndarray,
-    user_ids: Optional[np.ndarray] = None,
+    user_ids_ctr: Optional[np.ndarray] = None,
+    user_ids_cvr: Optional[np.ndarray] = None,
 ) -> Dict[str, float]:
     metrics = {
         "ctr_auc": calculate_auc(y_true_ctr, y_pred_ctr),
@@ -53,8 +54,9 @@ def calculate_ranking_metrics(
         "cvr_auc": calculate_auc(y_true_cvr, y_pred_cvr),
         "cvr_logloss": float(log_loss(y_true_cvr, np.clip(y_pred_cvr, 1e-6, 1 - 1e-6))),
     }
-    if user_ids is not None:
-        metrics["ctr_gauc"] = calculate_gauc(user_ids, y_true_ctr, y_pred_ctr)
-        metrics["cvr_gauc"] = calculate_gauc(user_ids, y_true_cvr, y_pred_cvr)
+    if user_ids_ctr is not None and len(user_ids_ctr) == len(y_true_ctr):
+        metrics["ctr_gauc"] = calculate_gauc(user_ids_ctr, y_true_ctr, y_pred_ctr)
+    if user_ids_cvr is not None and len(user_ids_cvr) == len(y_true_cvr):
+        metrics["cvr_gauc"] = calculate_gauc(user_ids_cvr, y_true_cvr, y_pred_cvr)
 
     return metrics

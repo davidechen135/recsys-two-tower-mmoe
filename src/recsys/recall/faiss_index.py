@@ -14,11 +14,19 @@ from ..models.dssm import TwoTowerDSSM
 class GlobalPopularityRecall:
     """Baseline 1: Global Popularity."""
 
-    def __init__(self, item_counts: np.ndarray):
-        self.ranked_items = np.argsort(-item_counts)
+    def __init__(self, item_meta_df):
+        sorted_df = item_meta_df.sort_values("total_interactions", ascending=False)
+        self.ranked_items = sorted_df["item_id"].values
 
     def retrieve(self, top_k: int = 100) -> np.ndarray:
         return self.ranked_items[:top_k]
+
+    def retrieve_batch(self, n_users: int, top_k: int = 100) -> tuple[Dict[int, np.ndarray], float]:
+        start = time.perf_counter()
+        top_items = self.retrieve(top_k)
+        retrievals = {u: top_items for u in range(n_users)}
+        elapsed_ms = (time.perf_counter() - start) * 1000.0 / max(1, n_users)
+        return retrievals, elapsed_ms
 
 
 class ItemCFRecall:
@@ -26,39 +34,46 @@ class ItemCFRecall:
 
     def __init__(self, train_events_df, n_items: int):
         self.n_items = n_items
-        # Build user-item sparse interaction matrix
+        # Build user-item sparse interaction matrix with 1-indexed items
         users = train_events_df["user_id"].values
         items = train_events_df["item_id"].values
         data = np.ones(len(users), dtype=np.float32)
         n_users = int(users.max() + 1)
-        # Sparse matrix (n_items, n_users)
-        item_user = sp.csr_matrix((data, (items, users)), shape=(n_items, n_users))
+
+        # Sparse matrix (n_items + 1, n_users)
+        item_user = sp.csr_matrix((data, (items, users)), shape=(n_items + 1, n_users))
 
         # Item-item co-occurrence: A * A^T
         co_occ = item_user @ item_user.T
-        # Diagonal degrees
         degrees = np.array(co_occ.diagonal()).flatten()
         inv_sqrt_deg = 1.0 / np.maximum(np.sqrt(degrees), 1e-9)
-        # Cosine normalization: D^{-1/2} * co_occ * D^{-1/2}
         D = sp.diags(inv_sqrt_deg)
         self.sim_matrix = D @ co_occ @ D
         self.sim_matrix.setdiag(0.0)
 
     def retrieve(self, user_history: List[int], top_k: int = 100) -> np.ndarray:
-        if len(user_history) == 0:
-            return np.arange(top_k)
-        active_items = [i for i in user_history if i < self.n_items]
+        # Ignore 0 (PAD)
+        active_items = [i for i in user_history if 0 < i <= self.n_items]
         if len(active_items) == 0:
-            return np.arange(top_k)
+            return np.arange(1, min(top_k + 1, self.n_items + 1))
 
         # Aggregate similarity scores
         sub_sim = self.sim_matrix[active_items, :].sum(axis=0)
         scores = np.array(sub_sim).flatten()
-        # Zero out history
+        # Zero out padding and already-seen history
+        scores[0] = -1.0
         scores[active_items] = -1.0
-        top_indices = np.argpartition(-scores, top_k)[:top_k]
+
+        top_k_clamped = min(top_k, self.n_items)
+        top_indices = np.argpartition(-scores, top_k_clamped)[:top_k_clamped]
         sorted_top = top_indices[np.argsort(-scores[top_indices])]
         return sorted_top
+
+    def retrieve_batch(self, user_hist_dict: Dict[int, List[int]], top_k: int = 100) -> tuple[Dict[int, np.ndarray], float]:
+        start = time.perf_counter()
+        retrievals = {u: self.retrieve(hist, top_k) for u, hist in user_hist_dict.items()}
+        elapsed_ms = (time.perf_counter() - start) * 1000.0 / max(1, len(user_hist_dict))
+        return retrievals, elapsed_ms
 
 
 class FaissDSSMRecall:
@@ -74,11 +89,12 @@ class FaissDSSMRecall:
         self.model = model
         self.dim = dim
         self.index_type = index_type
+        self.item_id_map = item_meta_df["item_id"].values.astype(int)
 
         # Compute all item embeddings
         self.model.eval()
         with torch.no_grad():
-            item_ids = torch.tensor(item_meta_df["item_id"].values, dtype=torch.long)
+            item_ids = torch.tensor(self.item_id_map, dtype=torch.long)
             cat_ids = torch.tensor(item_meta_df["category_id"].values, dtype=torch.long)
             dense_cols = ["pv_to_cart_rate", "pv_to_buy_rate", "log_pv", "log_buy"]
             dense = torch.tensor(item_meta_df[dense_cols].values, dtype=torch.float32)
@@ -95,9 +111,16 @@ class FaissDSSMRecall:
     def retrieve_batch(self, user_vecs: np.ndarray, top_k: int = 100) -> tuple[np.ndarray, float]:
         user_vecs = user_vecs.astype(np.float32)
         start = time.perf_counter()
-        distances, indices = self.index.search(user_vecs, top_k)
+        distances, raw_indices = self.index.search(user_vecs, top_k)
         elapsed_ms = (time.perf_counter() - start) * 1000.0 / len(user_vecs)
-        return indices, elapsed_ms
+
+        # Map row indices back to real item_ids
+        # Handle -1 (unfilled slots if fewer than top_k items in index)
+        valid_mask = raw_indices >= 0
+        safe_indices = np.where(valid_mask, raw_indices, 0)
+        retrieved_items = np.where(valid_mask, self.item_id_map[safe_indices], 0)
+
+        return retrieved_items, elapsed_ms
 
 
 def evaluate_recall_metrics(

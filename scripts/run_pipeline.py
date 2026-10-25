@@ -4,10 +4,15 @@ from __future__ import annotations
 import os
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 os.environ["OMP_NUM_THREADS"] = "1"
+from pathlib import Path
+
+# OpenMP fallback for LightGBM on macOS
+_sklearn_dylibs = Path(__file__).resolve().parent.parent.parent / ".venv" / "lib" / "python3.12" / "site-packages" / "sklearn" / ".dylibs"
+if _sklearn_dylibs.exists() and "DYLD_FALLBACK_LIBRARY_PATH" not in os.environ:
+    os.environ["DYLD_FALLBACK_LIBRARY_PATH"] = str(_sklearn_dylibs)
 
 import argparse
 import json
-from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 

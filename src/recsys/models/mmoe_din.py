@@ -62,7 +62,11 @@ class MMoEDINRanking(nn.Module):
         # Embeddings
         self.user_emb = nn.Embedding(n_users, embed_dim)
         self.item_emb = nn.Embedding(n_items + 1, embed_dim, padding_idx=0)
-        self.cat_emb = nn.Embedding(n_cats, embed_dim // 2)
+        self.cat_emb = nn.Embedding(n_cats + 1, embed_dim // 2, padding_idx=0)
+
+        # Multi-task loss dynamic uncertainty weighting (Kendall et al., CVPR 2018)
+        self.log_var_ctr = nn.Parameter(torch.zeros(1))
+        self.log_var_cvr = nn.Parameter(torch.zeros(1))
 
         # DIN Attention Unit
         self.din_attention = DINAttentionUnit(embed_dim=embed_dim)
@@ -144,3 +148,29 @@ class MMoEDINRanking(nn.Module):
         p_cvr = torch.sigmoid(logit_cvr)
 
         return p_ctr, p_cvr, w_ctr.squeeze(-1), w_cvr.squeeze(-1)
+
+    def compute_multi_task_loss(
+        self,
+        p_ctr: torch.Tensor,
+        p_cvr: torch.Tensor,
+        y_ctr: torch.Tensor,
+        y_cvr: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Compute joint CTR and CVR loss with dynamic Uncertainty Weighting (Kendall et al., CVPR 2018)."""
+        loss_ctr = F.binary_cross_entropy(p_ctr, y_ctr)
+
+        # CVR is conditioned on click (y_ctr == 1)
+        click_mask = y_ctr == 1
+        if click_mask.any():
+            loss_cvr = F.binary_cross_entropy(p_cvr[click_mask], y_cvr[click_mask])
+        else:
+            loss_cvr = torch.tensor(0.0, device=p_ctr.device)
+
+        # Dynamic uncertainty weighting
+        precision_ctr = torch.exp(-self.log_var_ctr)
+        precision_cvr = torch.exp(-self.log_var_cvr)
+        loss = (
+            0.5 * precision_ctr * loss_ctr + 0.5 * self.log_var_ctr
+            + 0.5 * precision_cvr * loss_cvr + 0.5 * self.log_var_cvr
+        )
+        return loss, loss_ctr, loss_cvr

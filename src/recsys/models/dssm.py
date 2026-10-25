@@ -56,8 +56,8 @@ class ItemTower(nn.Module):
         dropout: float = 0.1,
     ):
         super().__init__()
-        self.item_emb = nn.Embedding(n_items, embed_dim)
-        self.cat_emb = nn.Embedding(n_cats, embed_dim // 2)
+        self.item_emb = nn.Embedding(n_items + 1, embed_dim, padding_idx=0)
+        self.cat_emb = nn.Embedding(n_cats + 1, embed_dim // 2, padding_idx=0)
         in_dim = embed_dim + embed_dim // 2 + dense_dim
         self.mlp = nn.Sequential(
             nn.Linear(in_dim, hidden_dim),

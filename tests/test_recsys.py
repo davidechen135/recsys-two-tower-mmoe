@@ -35,6 +35,16 @@ def test_duckdb_feature_extraction_no_leakage():
     assert max_train_t <= min_val_t
     assert max_val_t <= min_test_t
 
+    # Anti-leakage test: target item in history must NOT predict CVR with near-perfect AUC
+    from sklearn.metrics import roc_auc_score
+    test_rk = bundle.test_rank_df
+    inh = np.array([i in set(h) for i, h in zip(test_rk.item_id, test_rk.history_items)])
+    cvr_labels = test_rk["cvr_label"].values
+    if len(np.unique(cvr_labels)) == 2:
+        trivial_auc = roc_auc_score(cvr_labels, inh)
+        # Without leakage, trivial AUC must be close to random (~0.50), strictly < 0.70
+        assert trivial_auc < 0.70, f"Leakage detected: trivial rule AUC={trivial_auc}"
+
 
 def test_two_tower_dssm_forward_and_norm():
     n_users = 50

@@ -1,0 +1,26 @@
+# Default configuration for RecSys Two-Tower Recall & MMoE Ranking Pipeline
+data:
+  n_users: 3000
+  n_items: 1200
+  n_categories: 40
+  n_interactions: 80000
+  max_seq_len: 20
+  train_frac: 0.70
+  val_frac: 0.15
+
+recall:
+  embed_dim: 48
+  out_dim: 48
+  epochs: 3
+  batch_size: 256
+  lr: 0.002
+  top_k: 100
+
+ranking:
+  embed_dim: 32
+  expert_dim: 64
+  tower_dim: 32
+  n_experts: 4
+  epochs: 4
+  batch_size: 256
+  lr: 0.003

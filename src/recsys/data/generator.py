@@ -49,7 +49,11 @@ def generate_synthetic_user_behavior(
     # 3. User latent category affinities (top 3 preferred categories per user)
     user_top_cats = rng.choice(n_categories, size=(n_users, 3), replace=True)
 
-    # 4. Generate user sessions & interactions
+    # 4. Latent conversion traits for realistic funnel modeling
+    user_cvr_propensity = rng.normal(0, 0.5, size=n_users)
+    item_cvr_quality = rng.normal(0, 0.6, size=n_items)
+
+    # 5. Generate user sessions & interactions
     user_ids = []
     item_ids = []
     category_ids = []
@@ -95,9 +99,12 @@ def generate_synthetic_user_behavior(
         behaviors.append("pv")
         timestamps.append(t)
 
-        # Funnel transitions within session
-        rand_val = rng.random()
-        if rand_val < 0.22:
+        # Funnel transitions within session with latent user/item/category signals
+        cat_match = 1.0 if cat_id in user_top_cats[u] else -0.5
+        z_cart = -1.4 + 0.5 * user_cvr_propensity[u] + 0.5 * item_cvr_quality[item_idx] + 0.6 * cat_match
+        p_cart = 1.0 / (1.0 + np.exp(-z_cart))
+
+        if rng.random() < p_cart:
             # Cart action shortly after
             user_ids.append(u)
             item_ids.append(item_idx)
@@ -105,14 +112,16 @@ def generate_synthetic_user_behavior(
             behaviors.append("cart")
             timestamps.append(t + rng.integers(10, 60))
 
-            if rng.random() < 0.35:
+            z_buy = -0.7 + 0.6 * user_cvr_propensity[u] + 0.7 * item_cvr_quality[item_idx] + 0.5 * cat_match
+            p_buy = 1.0 / (1.0 + np.exp(-z_buy))
+            if rng.random() < p_buy:
                 # Buy after cart
                 user_ids.append(u)
                 item_ids.append(item_idx)
                 category_ids.append(cat_id)
                 behaviors.append("buy")
                 timestamps.append(t + rng.integers(70, 300))
-        elif rand_val < 0.30:
+        elif rng.random() < 0.15:
             # Fav action
             user_ids.append(u)
             item_ids.append(item_idx)
